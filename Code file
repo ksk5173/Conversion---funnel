@@ -1,0 +1,533 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+The goal of this analysis is to perform funnel analysis on anonymized data from an e-commerce website.
+
+Typically websites have a clear path to conversion: for instance,you land on the home page,then you search, select a product and buy it. At each of these steps, some users will drop off and leave the site. The sequence of pages that lead to conversion is called funnel. Analyzing this funnel can give insights on user behavior, when they drop off the site and how to improve the user experience.
+
+The source of data is split into 5 tables corresponding to user data and the other pages of the e-commerce website ranging from home page until confirmation page. We are tasked with reporting funnel rate for both desktop and mobiles and also other actionable insights that might help the product team to improve conversion rates.
+
+# Variables used in the data set.
+
+The following variables are used in the data set. 
+
+user_id - the id of the user. It is unique for each user
+
+date - the date when the user first landed on the site
+
+device - user device which could be mobile or desktop
+
+sex - male/female
+
+home page, search page, payment page and payment confirmation page - These are variables in 4 separate tables showing only the user id's of those users who reached that particular page. If a particular user id is found on the payments page and not on the payment confirmation page, it means that user dropped out before the final payment confirmation.
+
+We will begin our analysis by loading in the required packages first
+
+
+# Loading required packages
+
+We will begin by loading in the required packages (dplyr,randomforest,rpart and ggplot2)
+
+```{r echo=FALSE}
+require(dplyr)
+require(randomForest)
+require(rpart)
+require(ggplot2)
+require(gridExtra)
+require(ROSE)
+require(ROCR)
+require(lubridate)
+
+options(scipen = 999)
+```
+
+# Loading source data
+
+Once the required packages have been loaded, we now have to load in the source files from the given 5 tables. 
+
+
+```{r}
+userdata = read.csv("user_table.csv") #info about users
+homepage = read.csv("home_page_table.csv") #table showing users who are at the home page
+searchpage = read.csv("search_page_table.csv") #table showing users who made it to the search page
+paypage = read.csv("payment_page_table.csv") # table showing users who made it to the payments page
+payconfirm = read.csv("payment_confirmation_table.csv") #table showing users who made it to the final payment confirmation page
+
+```
+
+#PRE-PROCESSING THE DATA
+
+#Check for duplicates
+
+Before analyzing the data, it is necessary to pre-process the data and ensure it is analytics ready.
+
+We begin by checking for duplicates in the loaded tables. We find that there are no duplicate records in the tables
+
+```{r echo=FALSE}
+length(userdata$user_id) == length(unique(userdata$user_id))
+
+length(homepage$user_id) == length(unique(homepage$user_id))
+length(searchpage$user_id) == length(unique(searchpage$user_id))
+length(paypage$user_id) == length(unique(paypage$user_id))
+length(payconfirm$user_id) == length(unique(payconfirm$user_id))
+
+```
+
+#check for missing values  
+
+We also check for missing values in the tables and find there are no missing values in the individual tables
+
+```{r echo=FALSE}
+sapply(userdata, function(x) sum(is.na(x)))
+sapply(homepage, function(x) sum(is.na(x)))
+sapply(searchpage, function(x) sum(is.na(x)))
+sapply(paypage, function(x) sum(is.na(x)))
+sapply(payconfirm, function(x) sum(is.na(x)))
+
+```
+
+#merge all tables in one data set
+
+
+We now merge all the tables together to form one master data table.The NA's across the various columns indicates the concerned user did not make it to that page 
+
+
+```{r echo=FALSE}
+masterdata = Reduce(function(x,y) merge(x,y,by ='user_id',all.x=TRUE), list(userdata,homepage,searchpage,paypage,payconfirm))
+colnames(masterdata) = c("user_id","date","device","sex","homepage","searchpage","payments","paymentconfirmation")
+
+
+
+head(masterdata,5)
+
+```
+
+
+#get summary and structure of master data
+
+To get a concise view of the masterdata table we run the summary and the str command.
+
+```{r echo=FALSE}
+summary(masterdata)
+
+str(masterdata)
+
+```
+
+#Convert date field in master data table to date object
+
+```{r}
+masterdata$date = as.Date(masterdata$date)
+
+```
+
+
+#Add a class label for final conversion
+
+Adding a class label for the final conversion will help us when we build a machine learning model to predict conversion. Here the users who reach the payment confirmation page are considered as users who get a label of 1 for conversion and the rest get a value of 0
+
+
+```{r echo=FALSE}
+masterdata$conversion = ifelse(masterdata$`paymentconfirmation`== "payment_confirmation_page",1,0)
+masterdata$conversion[is.na(masterdata$conversion)]= 0 
+masterdata$conversion = as.factor(masterdata$conversion)
+
+head(masterdata,3)
+
+```
+
+#Exploratory analysis
+
+#Find count of customers who reach each page
+
+Now we start some exploratory data analysis. Starting off with getting the counts of customers who reach each page. We can see that the number of users drop by half between the home page and the search page. From the search page to the payments page the drop is 39000 and fInally at the confirmation page we are left with only 452 users who reach the payment confirmation page.
+
+
+```{r echo=FALSE}
+masterdata %>% group_by(homepage) %>% dplyr::summarise(page_count = n())
+masterdata %>% group_by(searchpage) %>% dplyr::summarise(page_count = n())
+masterdata %>% group_by(payments) %>% dplyr::summarise(page_count = n())
+masterdata %>% group_by(`paymentconfirmation`) %>% dplyr::summarise(page_count = n())
+
+```
+
+#Find customer segments grouped by device for each page
+Now let us find customer segments for each page grouped by device namely mobile vs desktop
+
+```{r echo=FALSE}
+device_count_home = masterdata %>% group_by(homepage,device)%>% dplyr::summarise(segment = n())
+
+device_count_search = masterdata %>% filter(!is.na(searchpage)) %>% group_by(searchpage,device)%>% dplyr::summarise(segment = n())
+
+device_count_pay = masterdata %>% filter(!is.na(payments)) %>% group_by(payments,device)%>% dplyr::summarise(segment = n())
+
+
+device_count_payconfirm = masterdata %>%filter(!is.na(`paymentconfirmation`))%>% group_by(`paymentconfirmation`,device)%>% dplyr::summarise(segment = n())
+```
+
+#Plots for customer segments for devices
+
+```{r echo=FALSE}
+homepagedeviceplot = ggplot(data = device_count_home, aes(x=device, y = segment)) + geom_bar(stat ="identity",aes(fill=device))+ ggtitle("Home page device split up") +labs(y="device count")
+
+searchpagedeviceplot = ggplot(data = device_count_search, aes(x=device, y = segment)) + geom_bar(stat ="identity",aes(fill=device)) + ggtitle("Search page device split up") + labs(y= "device count")
+
+paypagedeviceplot = ggplot(data = device_count_pay, aes(x=device, y = segment)) + geom_bar(stat ="identity",aes(fill=device)) + ggtitle("Payments page device split up") + labs (y = "device count")
+
+paymentconfirmplot = ggplot(data = device_count_payconfirm, aes(x=device, y = segment)) + geom_bar(stat ="identity",aes(fill=device)) + ggtitle("Payment confirmation page split up") + labs(y= "device count")
+
+
+```
+
+#Compare plots between home search and payment page for devices
+```{r echo = FALSE}
+grid.arrange(homepagedeviceplot,searchpagedeviceplot,paypagedeviceplot,paymentconfirmplot, nrow = 2 , ncol = 2)
+
+```
+
+
+From the plots we can see that on the home page a large number of users use desktop compared to mobile and this trend continues on the search page. On the payments page, there is a big drop in the number of customers who use desktop and this drop is even more significant on the payment confirmation page. Product management will probably need to look at the interface of the payments page and the payment confirmation page to understand why there is such a big drop in the number of users who use desktop.
+
+Insights from this plot
+
+1. On the home page a large number of users use desktop compared to mobile and this trend continues on the search page. On the payments page, there is a big drop in the number of customers who use desktop and this drop is even more significant on the payment confirmation page. 
+
+2. Overall number of users using mobile is half of the number of desktop users. Considering that mobile use is heavy these days, we should be having a larger number of mobile users. 
+
+3. Conversion rate of mobile is higher than desktop. Possible reasons for lower mobile users and higher conversion could be 
+
+  a. Maybe the app isn't as popular enough as it should be and hence you have very engaged users coming only and purchasing rather than a higher number of casual mobile users also coming to the site.
+  
+  b. Conversely maybe there is a large number of casual desktop users coming to the site and this could explain why we have larger number of desktop users but lesser conversion rate.
+  
+  c. We may also need to look at the spending for ads on desktop and see if they are attracting the wrong people as regards to conversion.
+
+#Analyzing mean conversion rates for different dates across the given date range
+
+```{r echo=FALSE}
+data_test = masterdata %>% group_by(date) %>% dplyr::summarize(conversion_rate = mean(as.numeric(conversion==1)))
+qplot(date, conversion_rate, data = data_test,geom="line")
+
+
+
+```
+
+
+By plotting the mean conversion rates across the different months we see that conversion rates are very high in the early part of January which is probably keeping in mind the new year sales. But in general we see, conversion rates are down in the second half of the 4 month period as opposed to the first 2 months.
+
+Maybe sales and marketing can look into this to increase marketing efforts to increase sales in this time period.
+
+Also there is a sudden dip in mid January and a spike in late February and mid April. Possible explanations for this could be a bug or maybe it was around this time period that there was a change in the website design.
+
+
+
+
+Distribution of mobile and desktop users is split equal across all 4 months from January to April. Table given below splits the number of mobile users across 3 pages for the first 2 months and last 2 months (March,April).
+
+Even though the number of users is contant for all months, the number of mobile users in the last 2 months across the search, payments and confirmation pages seem to be far lower than the first 2 months.
+
+This further validates our claim regarding the possibility of bug around March, or a design change in the site or mobile app or maybe changes in marketing and sales strategy.
+
+# Split by pages for mobile users for the first 2 months and last 2 months
+
+```{r echo=FALSE}
+
+# Split of mobile and desktop users by month
+
+masterdata %>% group_by(month(date),device)%>% dplyr::summarise(segment = n())
+
+a1 = masterdata %>% filter(searchpage != 0,month(date) < 3, device == "Mobile") %>% group_by(searchpage,device)%>% dplyr::summarise(segment = n())
+
+
+a2 = masterdata %>% filter(searchpage != 0,month(date) >= 3, device == "Mobile") %>% group_by(searchpage,device)%>% dplyr::summarise(segment = n())
+
+
+a3 = masterdata %>% filter(payments != 0 ,month(date) < 3, device == "Mobile") %>% group_by(payments,device)%>% dplyr::summarise(segment = n())
+
+
+a4 = masterdata %>% filter(payments != 0 ,month(date) >= 3, device == "Mobile") %>% group_by(payments,device)%>% dplyr::summarise(segment = n())
+
+
+
+a5 = masterdata %>% filter(conversion != 0 ,month(date) < 3, device == "Mobile") %>% group_by(conversion,device)%>% dplyr::summarise(segment = n())
+
+a7 = rbind(a1,a3,a5)
+
+a7 = a7[,c(2,3)]
+
+page = cbind(c("search","payment","confirmation"))
+
+a7 = cbind(page,a7)
+
+a6 = masterdata %>% filter(conversion != 0 ,month(date) >= 3, device == "Mobile") %>% group_by(conversion,device)%>% dplyr::summarise(segment = n())
+
+a8 = rbind(a2,a4,a6)
+a8 = a8[,c(2,3)]
+a8 = cbind(page,a8)
+
+a7 = cbind(a7,a8$segment)
+colnames(a7)[3] = "Count for January and February"
+colnames(a7)[4] = "Count for March and April"
+
+#Split by 2 month periods
+
+a7
+
+```
+
+# Analyzing customer segments by days of week (Feature Engineered variables)
+
+We can also analyze the date timestamp in by weekdays and weekends and see when how the trend looks. This day of week variable is a feature generated variable from the date variable and it allows for the date variable to be used in model building by extracting the day from the date.
+
+```{r echo=FALSE}
+masterdata$dayofweek = weekdays(masterdata$date)
+
+masterdata$dayofweek = as.factor(masterdata$dayofweek)
+
+head(masterdata,2)
+
+weekday_conversion = masterdata %>% filter(conversion == 1) %>% group_by(dayofweek)%>% dplyr::summarise(segment = n())
+
+ggplot(data = weekday_conversion, aes(x= dayofweek, y = segment)) + geom_bar(stat ="identity",aes(fill= dayofweek))+ ggtitle("Split of conversions by day of week") +labs(y="count")
+
+
+searchpage_conversion = masterdata %>% filter(searchpage == 'search_page') %>% group_by(dayofweek)%>% dplyr::summarise(segment = n())
+
+ggplot(data = searchpage_conversion, aes(x= dayofweek, y = segment)) + geom_bar(stat ="identity",aes(fill= dayofweek))+ ggtitle("Split of search page views by day of week") +labs(y="count")
+
+paymentpage_conversion = masterdata %>% filter(payments == 'payment_page') %>% group_by(dayofweek)%>% dplyr::summarise(segment = n())
+
+ggplot(data = paymentpage_conversion, aes(x= dayofweek, y = segment)) + geom_bar(stat ="identity",aes(fill= dayofweek))+ ggtitle("Split of payment page views by day of week") +labs(y="count")
+
+
+homepage_conversion = masterdata %>% filter(homepage == 'home_page') %>% group_by(dayofweek)%>% dplyr::summarise(segment = n())
+
+ggplot(data = homepage_conversion, aes(x= dayofweek, y = segment)) + geom_bar(stat ="identity",aes(fill= dayofweek))+ ggtitle("Split of home page views by day of week") +labs(y="count")
+
+```
+
+When we look at the split up of each page views by the day of the week, we find that it is fairly equal viewing on all days with a slight icrease being shown on Thursdays for the home page, search page and the payments page.
+
+When we go to the payments confirmation page, Monday and Saturday are the days on which the highest number of conversions are seen and Friday and Wednesday don't see as many number of conversions.
+
+Possible explanations could be special discounts offered on Monday and Saturday. We also have to investigate if there were any bugs in the system on Wednesdays or Fridays.
+
+
+#Analyzing customer segments by day of week and gender
+
+Another segment to check is how do males and females differ in which days they buy products. 
+
+```{r echo=FALSE}
+male_day_views = masterdata %>% filter(sex == "Male",conversion == 1) %>% group_by(dayofweek)%>% dplyr::summarise(segment = n())
+
+ggplot(data = male_day_views, aes(x= dayofweek, y = segment)) + geom_bar(stat ="identity",aes(fill= dayofweek))+ ggtitle("Split of Male conversions by day of week") +labs(y="count")
+
+female_day_views = masterdata %>% filter(sex == "Female", conversion == 1) %>% group_by(dayofweek)%>% dplyr::summarise(segment = n())
+
+ggplot(data = female_day_views, aes(x= dayofweek, y = segment)) + geom_bar(stat ="identity",aes(fill= dayofweek))+ ggtitle("Split of Female conversions by day of week") +labs(y="count")
+
+```
+
+
+From the graphs we see that Females buy the most on Mondays and Tuesdays and least on Fridays and Males buy the most on Thursdays and least on Wednesdays
+
+Based on this information we can create a new feature variable called "genderconversion" where we give a value of 1 for a combination of Males and Thursdays and Females and Mondays and Tuesdays. The rest can have a value of zero. As our main aim is trying to predict when will customers likely convert and buy a product, features like these can help in increasing ppredictive power
+
+
+Furthermore we can ask product development and marketing to tweak the website search page in order to show more of Men's products and discounts on Thursday and more of female products on Mondays and Tuesdays to captialize on increased conversions during those days
+
+```{r echo=FALSE}
+
+masterdata$genderconversion = ifelse((masterdata$sex == 'Male' & masterdata$dayofweek == "Thursday") | (masterdata$sex == 'Female' & masterdata$dayofweek == 'Monday') | (masterdata$sex == 'Female' & masterdata$dayofweek == 'Tuesday') | (masterdata$sex == 'Male' & masterdata$dayofweek == 'Monday') | (masterdata$sex == 'Male' & masterdata$dayofweek == 'Saturday'),1,0) 
+
+masterdata$genderconversion = as.factor(masterdata$genderconversion)
+
+head(masterdata,5)
+
+```
+
+
+
+#Machine learning
+
+Now we will move on to actually predicting users who will likely go upto the payment confirmation page. For building the model,we will be using 3 machine learning models for classification, decision trees, random forests and logistic regression and finally we will compare the AUC values of the 3 models 
+
+
+
+```{r echo=FALSE}
+masterdata$searchpage = as.character(masterdata$searchpage)
+ masterdata$searchpage[is.na(masterdata$searchpage)] = 0
+ masterdata$payments = as.character(masterdata$payments)
+ masterdata$payments[is.na(masterdata$payments)]= 0
+ masterdata$`paymentconfirmation` = as.character(masterdata$`paymentconfirmation`)
+ masterdata$`paymentconfirmation`[is.na(masterdata$`paymentconfirmation`)]= 0
+```
+
+
+```{r echo=FALSE}
+masterdata$payments = as.factor(masterdata$payments) #converting character variables back to factors
+masterdata$`payment confirmation` = as.factor((masterdata$`paymentconfirmation`))
+masterdata$searchpage = as.factor(masterdata$searchpage)
+
+```
+#Setting up data for random forest 
+
+For the sampling of the training data, I am going with a standard split of 66% data for the training set and the remaining for the test set.
+
+Since the training data is heavily imbalanced towards the 0 class, we are going to use oversampling to balance out the classes
+
+```{r}
+set.seed(89)
+sample_data = sample(1:nrow(masterdata),size = nrow(masterdata)*0.66)
+train_data = masterdata[sample_data,]
+test_data = masterdata[-sample_data,]
+
+table(train_data$conversion)
+
+train_data1 = train_data[,-c(2,5,8)]
+
+
+train_data_oversample = ovun.sample(conversion ~ device +  sex + searchpage + payments + dayofweek + genderconversion,data = train_data1, method = "over", N = 119268)$data
+
+table(train_data_oversample$conversion)
+
+```
+
+
+
+# Running a decision tree on the data
+
+We will begin by using a decision tree model tp predict conversions. We have left out user id, date and homepage variables from the input model. We get a AUC value of 0.96 using a decsion tree. 
+
+As can be 
+
+```{r echo=FALSE}
+
+
+tree_funnel = rpart(train_data_oversample$conversion ~ device + sex + searchpage + payments + dayofweek + genderconversion, data = train_data_oversample, method = "class")
+
+
+tree_predict_funnel = predict(tree_funnel, test_data[,-c(1,2,5,8,9)], type = "prob")
+
+tree_predict = predict(tree_funnel, test_data[,-c(1,2,5,8,9)], type = "class")
+
+table(tree_predict,test_data$conversion)
+
+misclasserror = round(mean(tree_predict != test_data$conversion),4)
+
+print(paste('Misclassification error',misclasserror))
+
+auc3 = (performance(prediction(tree_predict_funnel[,2],test_data$conversion),measure = "auc"))@y.values[[1]]
+
+perf1 = performance(prediction(tree_predict_funnel[,2],test_data$conversion),"tpr","fpr")
+```
+
+#Using a random forest to predict conversion 
+
+When assigning the parameters to the random forest function, we are excluding the user_id,date, payment and payment confirmation pages from the training data.
+
+
+```{r echo=FALSE}
+rf1 = randomForest(y = train_data_oversample$conversion, x = train_data_oversample[,c(1,2,3,4,6,7)],ytest = test_data$conversion, xtest = test_data[,c(3,4,6,7,10,11)] ,mtry =3, ntree = 100 ,keep.forest = TRUE)
+
+p2 = predict(rf1,test_data[,-c(1,2,5,8,9)], type = 'response')
+
+p3 = predict(rf1,test_data, type = "prob")
+table(p2,test_data$conversion)
+
+misclasserror1 = round(mean(p2 != test_data$conversion),4)
+
+print(paste('Misclassification error',misclasserror1))
+
+auc = (performance(prediction(p3[,2],test_data$conversion),measure = "auc"))@y.values[[1]]
+
+perf2 = performance(prediction(p3[,2],test_data$conversion),"tpr","fpr")
+
+```
+
+
+```{r echo=FALSE}
+varImpPlot(rf1,type = 2)
+```
+
+
+#Partial dependcy plots
+```{r}
+op = par(mfrow=c(2,2))
+partialPlot(rf1,train_data_oversample,searchpage,1)
+partialPlot(rf1,train_data_oversample,device,1)
+partialPlot(rf1,train_data_oversample,sex,1)
+partialPlot(rf1,train_data_oversample,dayofweek,1)
+
+```
+
+By looking at the partial dependence plots, we see that desktop users tend to cause a significant negative effect on the conversion rate than mobile users. Hence product management would be recommeneded to focus on getting the interface right for desktop users in the payments and confirmation page. Sales and Marketing should focus on getting more number of mobile users to vvisit the site.
+
+Also, we see that there is no big difference between males and females.
+
+Per the random forest model,Thursday and Tuesdays are the best days for conversion with Wednesday being the lowest probability day of conversion
+
+#logistic regression model
+
+Let us fit a logistic regression model to the data.
+
+```{r echo=FALSE}
+
+logistic_funnel = glm(train_data_oversample$conversion ~ device + sex + searchpage + payments + dayofweek + genderconversion, data = train_data_oversample, family = "binomial")
+
+p5 = predict(logistic_funnel, test_data[,-c(1,2,5,8,9)], type = "response")
+
+p5.pred = rep(0,nrow(test_data))
+
+p5.pred[p5 > 0.5] = 1
+
+table(p5.pred,test_data$conversion)
+
+misclasserror2 = round(mean(p5.pred != test_data$conversion),4)
+
+print(paste('Misclassification erro', misclasserror2))
+
+auc2 = (performance(prediction(p5,test_data$conversion),measure = "auc"))@y.values[[1]]
+
+perf3 = performance(prediction(p5,test_data$conversion),"tpr","fpr")
+
+```
+
+Comparing the AUC values of the three models along with the AUC plots.
+
+```{r echo=FALSE}
+
+AUC_comparison = data.frame(cbind(auc3,auc,auc2))
+colnames(AUC_comparison) = c("AUC for Decision tree"," AUC for Random Forest","AUC for Logistic regression")
+
+AUC_comparison
+
+plot(perf1, lty = 3, lwd = 3, col = "red", main = "Comparison of AUC curves")
+plot(perf2,add=TRUE, lty = 3, lwd = 3, col = "blue")
+
+plot(perf3, add= TRUE,lty =3, lwd = 3, col = "black")
+
+legend(0.6,0.9,legend = c("Decision tree","Random forest","Logistic regression"), col=c("red","blue","black"),lty = 3)
+
+```
+
+Final Summary
+
+1. Total number of users visting the search page is half of the number of users going to the home page. This number further reduces as we process to the payments page and finally only 450 customers buy the product in the final confirmation page.
+
+2. Comparing mobile vs dekstop, we see that the number of desktop users reduces drastically as we move from the search page to the payments page and the final confirmation page. A larger number of mobile users convert compared to desktop users.
+
+3. Total number of mobile users is half of dekstop users indicating efforts need to be put to increase mobile user base. Options to look at are the popularity of the app, interface of the mobile site and ease of use as the low number of mobile users indicates only engaged customers use the app and not a large number of casual users.
+
+4. For dekstop we have the converse situation where there are potentially a large number of casual users of the site which could possibly explain why the number of dekstop users is large but only very few convert. Other areas to look at include design and interface of the payments and final confirmation page as that is where a lot of desktop users leave the funnel.The desktop Ads team can also look at these users who come to the site but do not purchase and can try to optmize the ads better. 
+
+5. If we look at the user conversion rate across months, January and February have higher conversion rates compared to April and March. Also number of mobile users who convert are lower for the last 2 months across the search, payment and confirmation pages as compared to the first 2 months. All these point to possible bugs in the system around that time frame or design changes to the site in March.
+
+6. When we look at conversion for males and females, we find that males tend to buy more on Thursdays and females tend to buy more on tuesdays and Mondays . The conversions are also least on Fridays and Wednesdays for women and men respectiely. Sales, marketing and product development can look into this to better optimize the site on those days via coupons or offers to improve conversions.
+
+7. We ran 3 different machine learning models on the data and predicted who are the users who are most likely to convert. Of the three models we ran, namely, decsion trees, random forests and logistic regression the last method, logisitc regression gave the highest auc value.
+
+8. The most important factors in deciding conversion is if the user visits the site through a mobile or desktop with mobiles featuring higher conversion. Also users who go to the search page have higher chances of converting. Gender has no role to play in final conversion but day of week affects conversion with Thursday and Tuesday more favorable towards conversion and Fridays and Wednesdays not favoring final user conversion.
+
